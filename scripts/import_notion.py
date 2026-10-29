@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Import a Notion database-page export (Markdown & CSV) into labs/<slug>/.
+"""Import finished labs from a Notion database export (Markdown & CSV).
 
 Run from the repo root:
-    python3 scripts/import_notion.py ~/Downloads/Export-xxxx.zip
+    python3 scripts/import_notion.py ~/Downloads/Export-xxxx.zip [--force]
 
-What it does:
-  - names the folder from the page title ("Day 11 - Static Routes" -> labs/day-11-static-routes)
+Works for one lab or all of them. Export the Labs database only, not the
+parent page, so your theory notes never end up in the export.
+
+A page is imported only if:
+  - "Lab Done" is ticked in Notion, and
+  - "GitHub Write-up" is NOT ticked (already published), unless you pass --force.
+So theory notes, unfinished labs and already-pushed labs are skipped.
+
+For each imported page it:
+  - names the folder from the title ("Day 11 - Static Routes" -> labs/day-11-static-routes)
   - turns the exported properties into a header table (hides the ones in HIDE)
   - copies referenced images into images/ with clean names and fixes the links
   - saves any existing README.md as README.md.bak (gitignored)
-  - refreshes the lab index in the root README.md between the LABS markers
+Then it refreshes the lab index in the root README.md between the LABS markers.
 Accepts a .zip or an unzipped export folder.
 """
 import re
@@ -18,6 +26,7 @@ import sys
 import tempfile
 import urllib.parse
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 IMG = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
@@ -35,6 +44,8 @@ START, END = "<!-- LABS:START -->", "<!-- LABS:END -->"
 
 def extract(src: str, tmp: str) -> Path:
     p = Path(src).expanduser()
+    if not p.exists():
+        sys.exit(f"Can't find {p}")
     if p.is_dir():
         return p
     with zipfile.ZipFile(p) as z:
@@ -86,6 +97,45 @@ def header_table(props) -> str:
     return "| | |\n|---|---|\n" + "\n".join(f"| **{k}** | {v} |" for k, v in rows)
 
 
+def import_page(page: Path, force: bool):
+    """Returns (status, title). status is 'ok' or a skip reason."""
+    title, props, body = split_page(page.read_text(encoding="utf-8"))
+    flags = {k.lower(): v.lower() for k, v in props}
+    if flags.get("lab done") != "yes":
+        return "not marked Lab Done", title
+    if flags.get("github write-up") == "yes" and not force:
+        return "already published", title
+
+    target = Path("labs") / slugify(title)
+    img_dir = target / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    used, done = set(), {}
+
+    def fix(m: re.Match) -> str:
+        alt, url = m.group(1), m.group(2)
+        if url.startswith(("http://", "https://", "data:")):
+            return m.group(0)
+        f = (page.parent / urllib.parse.unquote(url)).resolve()
+        if not f.is_file() or f.suffix.lower() not in IMG:
+            return m.group(0)
+        if f not in done:
+            done[f] = clean_name(f.name, used)
+            shutil.copy2(f, img_dir / done[f])
+        return f"![{alt}](images/{done[f]})"
+
+    out = f"# {title}\n\n{header_table(props)}\n\n{LINK.sub(fix, body)}".rstrip() + "\n"
+    readme = target / "README.md"
+    if readme.exists():
+        shutil.copy2(readme, target / "README.md.bak")
+    readme.write_text(out, encoding="utf-8")
+    if "notion.so" in out or "notion.site" in out:
+        print(f"  Warning: Notion links in {readme}. Review before pushing.")
+    if not done and "![" in body:
+        print(f"  Note: {readme} has images that were not found in the export.")
+    print(f"  + {readme}  ({len(done)} image(s))")
+    return "ok", title
+
+
 def update_index() -> None:
     readme = Path("README.md")
     if not readme.exists():
@@ -107,51 +157,34 @@ def update_index() -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        sys.exit("Usage: import_notion.py <export.zip|folder>")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    force = "--force" in sys.argv[1:]
+    if len(args) != 1:
+        sys.exit("Usage: import_notion.py <export.zip|folder> [--force]")
     if not Path(".git").exists():
         sys.exit("Run this from the repo root (the folder containing .git).")
 
+    results = Counter()
     with tempfile.TemporaryDirectory() as tmp:
-        root = extract(sys.argv[1], tmp)
-        pages = sorted(root.rglob("*.md"), key=lambda p: p.stat().st_size, reverse=True)
+        root = extract(args[0], tmp)
+        pages = sorted(root.rglob("*.md"))
         if not pages:
-            sys.exit("No .md file found in the export.")
-        page = pages[0]
-        if len(pages) > 1:
-            print(f"Note: {len(pages)} pages found, using the largest: {page.name}")
-
-        title, props, body = split_page(page.read_text(encoding="utf-8"))
-        target = Path("labs") / slugify(title)
-        img_dir = target / "images"
-        img_dir.mkdir(parents=True, exist_ok=True)
-        used, done, copied = set(), {}, 0
-
-        def fix(m: re.Match) -> str:
-            nonlocal copied
-            alt, url = m.group(1), m.group(2)
-            if url.startswith(("http://", "https://", "data:")):
-                return m.group(0)
-            f = (page.parent / urllib.parse.unquote(url)).resolve()
-            if not f.is_file() or f.suffix.lower() not in IMG:
-                return m.group(0)
-            if f not in done:
-                done[f] = clean_name(f.name, used)
-                shutil.copy2(f, img_dir / done[f])
-                copied += 1
-            return f"![{alt}](images/{done[f]})"
-
-        out = f"# {title}\n\n{header_table(props)}\n\n{LINK.sub(fix, body)}".rstrip() + "\n"
-        readme = target / "README.md"
-        if readme.exists():
-            shutil.copy2(readme, target / "README.md.bak")
-        readme.write_text(out, encoding="utf-8")
+            sys.exit("No .md files found in the export.")
+        print(f"Found {len(pages)} page(s) in the export.")
+        for page in pages:
+            status, _title = import_page(page, force)
+            results[status] += 1
 
     update_index()
-    print(f"Wrote {readme} and copied {copied} image(s).")
-    if "notion.so" in out or "notion.site" in out:
-        print("Warning: Notion links found in the file. Review before pushing.")
-    print("Next: check it renders, add your .pkt to the folder, then commit and push.")
+    print(f"\nImported: {results['ok']}")
+    for reason, n in results.items():
+        if reason != "ok":
+            print(f"Skipped ({reason}): {n}")
+    if results["ok"]:
+        print("Next: check a few render, add your .pkt files to the lab folders, commit and push,")
+        print("then tick GitHub Write-up on those rows in Notion.")
+    else:
+        print("Nothing imported. Tick Lab Done on finished labs (and untick GitHub Write-up to re-import).")
 
 
 if __name__ == "__main__":
